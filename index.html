@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EarlyPrint Text Downloader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+  <div class="container">
+
+    <h1>EarlyPrint Text Downloader</h1>
+    <p class="subtitle">Upload a CSV of TCP text IDs to download the matching XML files as a .zip archive.</p>
+
+    <!-- Main card: shows upload form, then single-batch progress -->
+    <div class="card" id="main-card">
+      <div class="notice notice-warn">
+        <strong>Before you begin</strong>
+        <ul>
+          <li>Individual texts range from a few hundred KB to <strong>~19 MB</strong> each. Large batches may take several minutes — keep this tab open.</li>
+          <li>Lists longer than <strong>1,000 IDs</strong> will be split into multiple zip files and downloaded one at a time automatically.</li>
+          <li>Your CSV should have one TCP ID per row in the <strong>first column</strong> (e.g. <code>A00001</code>, <code>B21453</code>). A header row is fine.</li>
+          <li>Any IDs that cannot be found will be listed in an <code>errors.txt</code> inside the zip.</li>
+        </ul>
+      </div>
+
+      <div id="upload-section">
+        <form id="download-form">
+          <label for="csv_file" class="field-label">CSV file</label>
+          <input class="file-input" type="file" id="csv_file" accept=".csv,text/csv" required>
+          <button type="submit" class="btn btn-primary" id="submit-btn">Download .zip</button>
+        </form>
+      </div>
+
+      <div id="single-progress" class="progress-section" style="display:none">
+        <div class="status-row">
+          <div class="spinner"></div>
+          <span id="single-status"></span>
+          <span class="elapsed" id="file-count"></span>
+        </div>
+        <div class="progress-track" id="fetch-progress" style="display:none">
+          <div class="progress-fill" id="fetch-bar"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Multi-batch card: appears below the main card for >1000 IDs -->
+    <div id="multi-section" class="card" style="display:none; margin-top:1rem">
+      <div class="progress-header">
+        <span id="overall-status"></span>
+        <span id="batch-counter"></span>
+      </div>
+      <div class="progress-track" style="margin-bottom:1.5rem">
+        <div class="progress-fill" id="overall-bar"></div>
+      </div>
+      <ul class="batch-list" id="batch-list"></ul>
+      <div class="status-row" style="margin-top:1rem; padding-top:1rem; border-top:1px solid #f0ede8">
+        <div class="spinner"></div>
+        <span id="batch-status"></span>
+        <span class="elapsed" id="batch-file-count"></span>
+      </div>
+      <div class="progress-track" style="margin-top:0.5rem">
+        <div class="progress-fill" id="batch-bar"></div>
+      </div>
+    </div>
+
+    <div id="done-area" style="display:none; margin-top:1rem">
+      <div class="notice notice-success">
+        Download complete! <a href=".">Download another CSV</a>
+      </div>
+    </div>
+
+    <div id="error-area" style="margin-top:1rem"></div>
+
+  </div><!-- .container -->
+
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script>
+    // ← Replace with your Cloudflare Worker URL after deploying worker.js
+    const WORKER_URL = 'https://old-lake-4de3.purple-fog-c1e6.workers.dev/';
+
+    const BATCH_SIZE = 1000;
+    const CONCURRENCY = 10;
+
+    const $       = id  => document.getElementById(id);
+    const show    = id  => $(id).style.display = 'block';
+    const hide    = id  => $(id).style.display = 'none';
+    const setText = (id, t)   => $(id).textContent = t;
+    const setWidth = (id, pct) => $(id).style.width = pct + '%';
+
+    function showError(msg) {
+      $('error-area').innerHTML = `<div class="notice notice-error">${msg}</div>`;
+      hide('single-progress');
+      hide('multi-section');
+      show('upload-section');
+      $('submit-btn').disabled = false;
+    }
+
+    function parseIds(text) {
+      return text
+        .replace(/^﻿/, '')
+        .split(/\r\n|\r|\n/)
+        .map(line => line.trim().split(',')[0].replace(/^["']|["']$/g, '').trim().toUpperCase())
+        .filter(val => /^[A-Za-z]\d{3,}/.test(val));
+    }
+
+    async function fetchText(id) {
+      const resp = await fetch(`${WORKER_URL}/${id.slice(0, 3)}/${id}.xml`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return resp.arrayBuffer();
+    }
+
+    async function buildZip(ids, onProgress) {
+      const zip = new JSZip();
+      const errors = [];
+      let done = 0;
+      for (let i = 0; i < ids.length; i += CONCURRENCY) {
+        await Promise.all(
+          ids.slice(i, i + CONCURRENCY).map(async id => {
+            try {
+              zip.file(`${id}.xml`, await fetchText(id));
+            } catch (e) {
+              errors.push(`${id}: ${e.message}`);
+            }
+            onProgress(++done, ids.length);
+          })
+        );
+      }
+      if (errors.length) {
+        zip.file('errors.txt',
+          ['The following IDs could not be downloaded:', '', ...errors].join('\n'));
+      }
+      return zip;
+    }
+
+    async function triggerDownload(zip, filename) {
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      const url = URL.createObjectURL(blob);
+      const a = Object.assign(document.createElement('a'), { href: url, download: filename });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    async function runSingleBatch(ids) {
+      hide('upload-section');
+      show('single-progress');
+      show('fetch-progress');
+      setText('single-status', `Fetching ${ids.length} text${ids.length !== 1 ? 's' : ''}…`);
+
+      const zip = await buildZip(ids, (done, total) => {
+        setText('file-count', `${done} / ${total}`);
+        setWidth('fetch-bar', Math.round(done / total * 100));
+      });
+
+      hide('fetch-progress');
+      setText('single-status', 'Building zip…');
+      setText('file-count', '');
+
+      await triggerDownload(zip, 'eebo_texts.zip');
+
+      hide('main-card');
+      show('done-area');
+    }
+
+    async function runMultiBatch(batches) {
+      hide('upload-section');
+      $('batch-list').innerHTML = batches.map((_, i) => `
+        <li class="batch-item">
+          <span class="batch-name">eebo_texts_batch_${i + 1}.zip</span>
+          <span class="batch-status" id="badge-${i}" data-state="waiting">Waiting</span>
+        </li>`).join('');
+      setText('overall-status', `0 of ${batches.length} batches done`);
+      setText('batch-counter', `0 / ${batches.length}`);
+      show('multi-section');
+
+      for (let i = 0; i < batches.length; i++) {
+        const badge = $(`badge-${i}`);
+        badge.dataset.state = 'active';
+        badge.textContent = 'Downloading…';
+        setText('overall-status', `Batch ${i + 1} of ${batches.length}`);
+        setText('batch-status', `Fetching ${batches[i].length} texts…`);
+        setWidth('batch-bar', 0);
+        setText('batch-file-count', '');
+
+        const zip = await buildZip(batches[i], (done, total) => {
+          setText('batch-file-count', `${done} / ${total}`);
+          setWidth('batch-bar', Math.round(done / total * 100));
+        });
+
+        setText('batch-status', 'Building zip…');
+        setText('batch-file-count', '');
+        await triggerDownload(zip, `eebo_texts_batch_${i + 1}.zip`);
+
+        badge.dataset.state = 'done';
+        badge.textContent = 'Done';
+        setText('batch-counter', `${i + 1} / ${batches.length}`);
+        setWidth('overall-bar', Math.round((i + 1) / batches.length * 100));
+      }
+
+      setText('overall-status', 'All downloads complete!');
+      hide('multi-section');
+      show('done-area');
+    }
+
+    document.getElementById('download-form').addEventListener('submit', async function (e) {
+      e.preventDefault();
+      $('error-area').innerHTML = '';
+      hide('done-area');
+
+      if (WORKER_URL === 'https://YOUR_WORKER.workers.dev') {
+        showError('Please update the <code>WORKER_URL</code> in index.html with your Cloudflare Worker URL.');
+        return;
+      }
+
+      $('submit-btn').disabled = true;
+
+      const ids = parseIds(await $('csv_file').files[0].text());
+
+      if (!ids.length) {
+        showError('No valid text IDs found in the CSV. IDs should start with a letter followed by digits (e.g. A00001).');
+        return;
+      }
+
+      const batches = [];
+      for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+        batches.push(ids.slice(i, i + BATCH_SIZE));
+      }
+
+      try {
+        if (batches.length === 1) {
+          await runSingleBatch(ids);
+        } else {
+          await runMultiBatch(batches);
+        }
+      } catch (err) {
+        showError(`Download failed: ${err.message}`);
+      } finally {
+        $('submit-btn').disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
