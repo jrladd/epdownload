@@ -52,7 +52,7 @@ h1 {
   color: #78350f;
 }
 
-.notice-warn strong {
+.notice-warn > strong {
   display: block;
   color: #92400e;
   font-weight: 600;
