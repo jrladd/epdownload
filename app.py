@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify, render_template, request, send_file, flash, redirect, url_for, abort
 
 app = Flask(__name__)
-app.secret_key = "change-me-in-production"
+app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production")
+
 
 BATCH_SIZE = 1000
 MAX_WORKERS = 10
