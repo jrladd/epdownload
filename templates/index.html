@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EarlyPrint Text Downloader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+
+    <h1>EarlyPrint Text Downloader</h1>
+    <p class="subtitle">Upload a CSV of TCP text IDs to download the matching XML files as a .zip archive.</p>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="notice {{ 'notice-error' if category == 'error' else 'notice-success' }}" style="margin-bottom:1rem">
+            {{ message }}
+          </div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <div class="card">
+
+      <div class="notice notice-warn">
+        <strong>Before you begin</strong>
+        <ul>
+          <li>Individual texts range from a few hundred KB to <strong>~19 MB</strong> each. Large batches may take several minutes — keep this tab open.</li>
+          <li>Lists longer than <strong>{{ batch_size }} IDs</strong> will be split into multiple zip files and downloaded one at a time automatically.</li>
+          <li>Your CSV should have one TCP ID per row in the <strong>first column</strong> (e.g. <code>A00001</code>, <code>B21453</code>). A header row is fine.</li>
+          <li>Any IDs that cannot be found will be listed in an <code>errors.txt</code> inside the zip.</li>
+        </ul>
+      </div>
+
+      <form method="post" action="/download" enctype="multipart/form-data" id="download-form">
+        <label for="csv_file" class="field-label">CSV file</label>
+        <input class="file-input" type="file" id="csv_file" name="csv_file"
+               accept=".csv,text/csv" required>
+        <button type="submit" class="btn btn-primary" id="submit-btn">Download .zip</button>
+      </form>
+
+      <div id="progress-area" class="progress-section" style="display:none">
+        <div class="status-row">
+          <div class="spinner" id="spinner"></div>
+          <span id="status-text"></span>
+          <span class="elapsed" id="elapsed"></span>
+        </div>
+        <div class="progress-track" id="dl-progress" style="display:none">
+          <div class="progress-fill" id="dl-bar"></div>
+        </div>
+      </div>
+
+    </div><!-- .card -->
+
+    <div id="done-area" style="display:none; margin-top:1rem">
+      <div class="notice notice-success">
+        Download complete! <a href="/">Download another CSV</a>
+      </div>
+    </div>
+
+    <div id="error-area" style="margin-top:1rem"></div>
+
+  </div><!-- .container -->
+
+  <script>
+    const ID_PATTERN = /^[A-Za-z]\d{3,}/;
+
+    function countIds(file) {
+      return new Promise(resolve => {
+        const reader = new FileReader();
+        reader.onload = e => {
+          const text = e.target.result.replace(/^﻿/, ''); // strip BOM
+          const count = text
+            .split(/\r\n|\r|\n/)
+            .map(line => line.trim().split(',')[0].replace(/^["']|["']$/g, '').trim())
+            .filter(val => ID_PATTERN.test(val))
+            .length;
+          resolve(count);
+        };
+        reader.onerror = () => resolve(0);
+        reader.readAsText(file);
+      });
+    }
+
+    function setStatus(msg) {
+      document.getElementById('status-text').textContent = msg;
+    }
+
+    function showError(msg) {
+      document.getElementById('error-area').innerHTML =
+        `<div class="notice notice-error">${msg}</div>`;
+      document.getElementById('progress-area').style.display = 'none';
+      document.getElementById('submit-btn').disabled = false;
+    }
+
+    document.getElementById('download-form').addEventListener('submit', async function (e) {
+      e.preventDefault();
+
+      const submitBtn  = document.getElementById('submit-btn');
+      const progressArea = document.getElementById('progress-area');
+      const elapsedEl  = document.getElementById('elapsed');
+
+      submitBtn.disabled = true;
+      document.getElementById('error-area').innerHTML = '';
+      progressArea.style.display = 'block';
+
+      // Stage 1: count IDs client-side
+      setStatus('Reading CSV…');
+      const file = document.getElementById('csv_file').files[0];
+      const idCount = await countIds(file);
+
+      // Stage 2: server fetches from Bitbucket — show elapsed timer
+      const countLabel = idCount > 0 ? `${idCount} text${idCount !== 1 ? 's' : ''}` : 'texts';
+      setStatus(`Fetching ${countLabel} from Bitbucket…`);
+      const start = Date.now();
+      const timer = setInterval(() => {
+        const s = Math.round((Date.now() - start) / 1000);
+        elapsedEl.textContent = `(${s}s)`;
+      }, 1000);
+
+      try {
+        const response = await fetch('/download', {
+          method: 'POST',
+          body: new FormData(this),
+          headers: { 'X-Requested-With': 'fetch' },
+        });
+
+        clearInterval(timer);
+        elapsedEl.textContent = '';
+
+        if (!response.ok) {
+          const data = await response.json();
+          showError(data.error || 'An unexpected error occurred.');
+          return;
+        }
+
+        const contentType = response.headers.get('Content-Type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await response.json();
+          if (data.redirect) {
+            setStatus('Preparing batch downloads…');
+            window.location.href = data.redirect;
+          }
+          return;
+        }
+
+        // Stage 3: stream the zip down, show progress bar if Content-Length known
+        setStatus('Saving zip file…');
+        const contentLength = parseInt(response.headers.get('Content-Length') || '0');
+        let blob;
+
+        if (contentLength > 0) {
+          const dlProgress = document.getElementById('dl-progress');
+          const dlBar = document.getElementById('dl-bar');
+          dlProgress.style.display = 'block';
+
+          const reader = response.body.getReader();
+          const chunks = [];
+          let received = 0;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            received += value.length;
+            dlBar.style.width = `${Math.round((received / contentLength) * 100)}%`;
+          }
+          blob = new Blob(chunks, { type: 'application/zip' });
+        } else {
+          blob = await response.blob();
+        }
+
+        // Stage 4: trigger the browser save dialog
+        setStatus('Opening download…');
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'eebo_texts.zip';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        progressArea.style.display = 'none';
+        document.getElementById('done-area').style.display = 'block';
+
+      } catch (err) {
+        clearInterval(timer);
+        showError(`Download failed: ${err.message}`);
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
