@@ -208,7 +208,7 @@ h1 {
   margin-bottom: 0.4rem;
 }
 
-.progress-header #status-text { color: #374151; }
+.progress-header #overall-status { color: #374151; }
 .progress-header #batch-counter { color: #9ca3af; }
 
 /* ── Misc ── */
